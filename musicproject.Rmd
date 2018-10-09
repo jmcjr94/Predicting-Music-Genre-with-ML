@@ -1,0 +1,281 @@
+---
+title: "Final Project"
+author: "Andrés Castro Araújo & Jon Campbell"
+date: "December 14, 2017"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r, include = FALSE}
+library(readr)
+library(tidyverse)
+library(knitr)
+library(caret)
+library(MASS)
+library(randomForest)
+library(gbm)
+library(pcaPP)
+
+set.seed(123)
+```
+
+# Introduction
+
+Build a classifier
+
+1. Exploratory Data Analysis: Cluster A. + Scree Plot
+
+2. Supervised Learning
+
+Description of features:
+
+We use a dataset that contains the features of 100 distinct songs from 23 different genres of electronic music. There are 71 features that were previously extracted using the [pyAudioAnalysis](https://github.com/tyiannak/pyAudioAnalysis) package for Python. For example, there are different measures for "beats per minute", "chromagram", "spectogram", etc.
+
+This dataset was downloaded from [Kaggle](https://www.kaggle.com/caparrini/beatsdataset).
+
+#Exploratory Data Analysis
+
+##PCA
+
+We first perform principal components analysis in exploratory analysis to see if the number of meaningful features may be reduced for interpretation. 71 features is much to consider without detailed study of audio analysis. It is possible that these can be boiled down into just a few concepts meaningful for substantive analysis. 
+
+```{r}
+mdf <- read_csv("~/Documents/Data Mining/data mining final/beatsdataset.csv")
+
+mdf <- mdf[, - 1]
+
+mdf$class <- as.factor(mdf$class)
+
+names(mdf) <- make.names(names(mdf))
+
+mdf_PCA <- mdf[, - 72]
+
+pr_out <- prcomp(mdf_PCA, scale = TRUE)
+
+pr_out$sdev
+
+pr.var <- pr_out$sdev^2
+
+pve <- pr.var / sum(pr.var)
+
+plot(pve, xlab="Principal Component", ylab="Proportion of Variance Explained ", ylim=c(0,1),type='b')
+cumsum(pve)
+plot(cumsum(pve), xlab = "Principal Component", ylab = "Cumulative Proportion of Variance Explained", ylim = c(0,1), type = 'b')
+```
+
+Scree plots indicate that fair gains in amounts of outcome variance can be explained with each additional component until number 30 or so, but this is still too many for cursory examination of our features. The first plot indicates that the first four components are most important, so we investigate these further. 
+
+```{r}
+X <- as.matrix(mdf_PCA)
+
+robust_PCA <- PCAproj(X, k = 4, scale = sd)
+robust_PCA$loadings
+
+```
+
+Examination of factor loadings indicate that particular features do not load strongly onto the four components, however groups can be discerned, such as `MFCC` features loading onto components 1 and 2, and those beginning with `Spectral` or `Chroma` load on onto component 3. `BPM`-related features load mostly onto component 4. 
+
+##Clustering
+
+We can also perform clustering to see if songs may easily be related by genre according to the predictors. Since songs are coded into 23 categories of genre, we might expect to see approximately the same number of clusters. 
+
+
+```{r}
+hc_complete <- hclust(dist(X), method = "complete")
+hc_average <- hclust(dist(X), method = "average")
+hc_single <- hclust(dist(X), method = "single")
+
+plot(hc_single, main = "Single Linkage", xlab = "", sub = "")
+abline(h = 16, col = 2)
+singclust <- table(cutree(hc_single, 16))
+singclust
+
+plot(hc_average, main = "Average Linkage", xlab = "", sub = "")
+abline(h = 44, col = 2)
+avgclust <- table(cutree(hc_average, 44))
+avgclust
+
+
+plot(hc_complete, main = "Complete Linkage", xlab = "", sub = "")
+abline(h = 95, col = 2)
+compclust <- table(cutree(hc_complete, 95))
+compclust
+```
+We determine the number of clusters to use for each approach with dendrogram cutting. Single linkage clustering comes the closest to approximating clusters near the number of existing genres, however, it is inclined to place large numbers of observations in the first few clusteres and place only one observation in later clusters. Each method is prone to this to a degree. This may indicate that some music genres are not clearly delineated.
+
+# Supervised Learning
+
+## Testing vs Training
+
+```{r}
+set.seed(123)
+## Create Testing and Training datasets
+index <- createDataPartition(mdf$class, p = 2/3, list = FALSE)
+
+training <- mdf[index, ]
+testing <- mdf[-index,]
+```
+
+
+## LDA
+Since the outcome we would like to predict, namely music genre, is recorded as unordered, categorical information, least squares regression could not appropriately discern observations into valid categories. Instead, we use linear discriminant analysis, which is a superior method to logistic regression when categories are well-defined, (such as with music genres) and additionally is often preferred when the outcome contains more than two classes, such as in this case.
+
+```{r}
+LDA <- lda(class ~ ., data = training)
+
+LDApred <- predict(LDA, newdata = testing)
+
+## Confusion Matrix
+LDAconfusion <- table(prediction = LDApred$class, data = testing$class)
+
+sort(
+round((diag(LDAconfusion) / colSums(LDAconfusion)) * 100, 2),
+decreasing = TRUE)
+
+## Percentage of Correct Classifications
+mean(LDApred$class == testing$class)
+```
+The model performed best for classifying `DrumAndBass,` `PsyTrance,` and `HardDance.` It performed worst for `Techno`  and `Dance`. 
+
+With a correct classification rate of approximately $48.6\%$ overall, this model performs substantially better than a baseline in which every genre is equally likely, where we might expect an accuracy rate of $\frac{1}{23}  \approx 4\%$. However, it is possible that we could obtain a better rate using more sophisticated methods.
+
+
+## Random Forest
+
+In the context of classification, Random Forests provide a form averaging the predictions of many, *many*, classification trees using *bootstrapped* samples. The purpose of this is to reduce variance and, thus, creating a model that performs better in the testing dataset. 
+
+The following procedure is designed to choose two parameters: 
+
+* `mtry`: This parameter specifies a *random sample of m predictors* used to construct each individual tree. (Note: When `mtry` = "total number of predictors" we call this approach *bagging* instead of *random forest*).
+
+* `treenum`: The number of trees used to perform the average. (This is not *that* important, but it is nice to choose them in way that doesn't appear arbitrary).
+
+```{r, message = FALSE}
+set.seed(123)
+
+obb_err <- rep(NA, length(mdf) - 1) ## create placeholder for out-of-bag error
+test_err <- rep(NA, length(mdf) - 1) ## create placeholder for test
+treenum <- rep(NA, length(mdf) - 1) ## create placeholder for optimal number of trees
+
+for (mtry in 1:length(obb_err)) {
+  fit <- randomForest(class ~ ., data = mdf, subset = index, ntree = 1000,
+                      mtry = mtry)
+  
+  treenum[mtry] <- which(fit$err.rate[1:1000] == min(fit$err.rate[1:1000]))[1]
+  obb_err[mtry] <- fit$err.rate[treenum[mtry]]
+  pred <- predict(fit, newdata = mdf[-index, ], type = "class")
+  test_err[mtry] <- mean(pred != mdf[-index, ]$class) 
+  
+  cat(mtry, "") ## This shows how long is the procedure taking in real-time.
+}
+
+```
+
+The following graph plots the *Out-of-Bag* error rates --equivalent to the *leave-one-out cross validation error*-- alongside the *Test Error* rates. Based on this graph, we decide to choose $33$ as our value for the `mtry` parameter.
+
+```{r, echo = FALSE}
+tibble(`Out-of-Bag Error` = obb_err, 
+       `Test Error` = test_err,
+        mtry = 1:mtry) %>% 
+   gather(`Out-of-Bag Error`, `Test Error`, key = test, value = error) %>% 
+  
+ggplot(aes(x = mtry, y = error, color = test)) +
+  geom_line() + 
+  geom_vline(xintercept = which(test_err == min(test_err)), 
+             linetype = "dashed") +
+  theme_classic(base_family = "Avenir") +
+  labs(y = "Classification Error", color = "") +
+  theme(legend.position = "top") + 
+  annotate("text", x = 50, y = 0.5,
+           label = "This value wins the contest")
+```
+
+The following lines of code run the best model out of 77 models, and determine the accuracy of the classifications. 
+
+```{r}
+set.seed(123)
+## Model
+mforest <- randomForest(formula = class ~ ., data = training, 
+                        mtry = which(test_err == min(test_err)), 
+                        ntree = treenum[which(test_err == min(test_err))], 
+                        importance = TRUE)
+
+## Prediction Accuracy
+forestpred <- predict(mforest, newdata = testing, type = "class")
+
+forestconfusion <- table(prediction = forestpred, data = testing$class)
+
+## Percentage of correct classifications
+sort(
+round((diag(forestconfusion) / colSums(forestconfusion)) * 100, 2),
+decreasing = TRUE)
+
+## Overall percentage of correct classifications
+mean(forestpred == testing$class)
+```
+
+This model --with a correct classification rate of $52.3\%$--  performs better the LDA classifier as well as the baseline in which every genre is equally likely.
+
+Just as it occured with LDA, the model performed best for classifying `PsyTrance`, `DrumAndBass`, and `HardDance` and performed worst for `Techno`  and `Dance.` 
+
+Looking at the results, `Techno` was often misclassified as `TechHouse`, likely a sub-genre of `Techno`. Perhaps `TechHouse` is an intermediate between `Techno` and `ProgressiveHouse`, the most common misclassification for `Techno`. 
+
+```{r, echo = FALSE}
+set.seed(123)
+
+forestconfusion <- ifelse(forestconfusion == 0, ".", forestconfusion)
+
+kable(caption = "Best and Worst Predictions",
+  (forestconfusion[ , c("PsyTrance", "HardDance","Techno", "Dance")]))
+
+```
+
+The following plots show the *importance* of each predictor for the model. The most important features are all related to *Beats Per Minute* (BPM).
+
+```{r}
+set.seed(123)
+varImpPlot(mforest, cex = 0.8, 
+           main = "Variable Importance in Random Forest", pch = 16)
+```
+
+We try a boosting approach as well to see if classification error can be reduced further. Unlike random forests, boosting uses the full set of training available available because it does not employ bootstrapping.
+
+## Boosting
+
+```{r}
+set.seed(123)
+mdfboost <- gbm(class ~ ., n.trees = 3000,
+                 distribution = "multinomial", data = training)
+
+summary(mdfboost, main = "Variable Importance in Boosting", 
+        las = 1, cBars = FALSE)
+
+## Get classification
+boostpred <- predict(mdfboost, newdata = testing, n.trees = 3000, 
+                        type = "response")
+boostpred2 <- apply(boostpred, 1, which.max)
+boostclass <- colnames(boostpred)[boostpred2]
+
+## Confusion Matrix
+boostconfusion <- table(prediction = boostclass, tdata = testing$class)
+
+## Percentage of correct classifications
+sort(
+round((diag(boostconfusion) / colSums(boostconfusion)) * 100, 2),
+decreasing = TRUE)
+
+## Proportion of Correct Predictions
+mean(boostclass == testing$class)
+```
+
+This classifier performs worse than both the LDA and random forest models, however its misclassification rate is not far off. Other similarities emerge in that `PsyTrance` and `DrumAndBass` are the most-accurately predicted. Further, `Techno` and `Dance` remain among the hardest genres to predict, though this model does perform better in that regard than others. A BPM-related variable emerges again as the most important for the classifier.  
+
+#Conclusions
+Of the three classifier models, the random forest approach is best able to predict music genre based on the music analysis features. It is the only one to achieve a misclassification rate under 50%, although the other models approach this goal within five percentage points. 
+
+The models' classification accuracies vary considerably between music genres, however. Certain genres, namely `PsyTrance` and `DrumAndBass` are consistently well-predicted, while `Dance` and `Techno` are often missclassified. Ostensibly similar genres, such as `Techno` and `HardcoreHardTechno` also tend to be confused. Possibly the models' heavy reliance on BPM-related variables relative to others is related to this. It could be that broader categories such as `Techno` and `HardcoreHardTechno` are similar in tempo but differ in qualities related to sound texture. If this were the case, a model that classifies largely according to BPM may miss these distinctions. Additional support is lended to this hypothesis by PCA results, which maintain that BPM is a construct which is orthogonal to other audio-related constructs to a degree. 
+
+An alternative explanantion is that songs may be too finely categorized into overly granular genres based on subjective factors which are not well represented by audio analysis features. Evidence from clustering analysis is mixed and finds optimal numbers of clusters that are either fewer in quantity than the number of genres given in the data (16 vs. 23) or much larger (95 vs. 23). This suggests that classification could be improved either by distilling overly specific genres into larger overarching categories, (i.e. `HardcoreHardTechno` could be absorbed into `Techno`) or by another approach utilizing different features which more accurately represent the data's genre categories. In either case, perhaps classification could be improved if genre data were quantitatively determined with a clustering or other similar function. 
