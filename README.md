@@ -1,5 +1,7 @@
 # Predicting Music Genre with ML
 
+# View the html report in your browser [here](jmcjr94.github.io)!
+
 A survey of performance for various supervised and unsupervised learning techniques in predicting genre from 71 Fourier Transform derived audio features.
 
 We implement the following approaches in R:
